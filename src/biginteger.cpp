@@ -348,16 +348,16 @@ void fastSecp384Mod(uint32_t* c, uint32_t* t, uint32_t* P) {
     carry += (int64_t)c[3] + c[15] + c[12] + c[20] + c[21] - c[14] - c[22] - c[23];
     t[3] = carry; carry >>= 32;
 
-    carry += (int64_t)c[4] + c[21] + c[21] + c[16] + c[13] + c[12] + c[22] - c[15] - c[23] - c[23];
+    carry += (int64_t)c[4] + c[21] + c[21] + c[16] + c[13] + c[12] + c[22] + c[20] - c[15] - c[23] - c[23];
     t[4] = carry; carry >>= 32;
 
-    carry += (int64_t)c[5] + c[22] + c[22] + c[17] + c[14] + c[13] + c[23] - c[16];
+    carry += (int64_t)c[5] + c[22] + c[22] + c[17] + c[14] + c[13] + c[23] + c[21] - c[16];
     t[5] = carry; carry >>= 32;
 
-    carry += (int64_t)c[6] + c[23] + c[23] + c[18] + c[15] + c[14] - c[17];
+    carry += (int64_t)c[6] + c[23] + c[23] + c[18] + c[15] + c[14] + c[22] - c[17];
     t[6] = carry; carry >>= 32;
 
-    carry += (int64_t)c[7] + c[19] + c[16] + c[15] - c[18];
+    carry += (int64_t)c[7] + c[19] + c[16] + c[15] + c[23] - c[18];
     t[7] = carry; carry >>= 32;
 
     carry += (int64_t)c[8] + c[20] + c[17] + c[16] - c[19];
@@ -405,7 +405,7 @@ BigInteger BigInteger::modSecP(BigInteger const& P) const {
             fastSecp256Mod(n, t, P.n);
         } else {
             if (usedLen < 8) {
-                for (int i = usedLen; i < 8; ++i) n[i] = 0;
+                for (int i = usedLen; i < 8; ++i) t[i] = 0;
             } else if (FastMath32::isLessThan(P.n, t, 8)) {
                 FastMath32::sub(t, t, P.n, 8);
             }
@@ -423,7 +423,7 @@ BigInteger BigInteger::modSecP(BigInteger const& P) const {
             fastSecp384Mod(n, t, P.n);
         } else {
             if (usedLen < 12) {
-                for (int i = usedLen; i < 12; ++i) n[i] = 0;
+                for (int i = usedLen; i < 12; ++i) t[i] = 0;
             } else if (FastMath32::isLessThan(P.n, t, 12)) {
                 FastMath32::sub(t, t, P.n, 12);
             }
@@ -432,6 +432,7 @@ BigInteger BigInteger::modSecP(BigInteger const& P) const {
 
     if (signum == -1) {
         FastMath32::sub(t, P.n, t, P.usedLen);
+        return BigInteger(1, t, P.usedLen);
     }
 
     return BigInteger(1, t, MIN(usedLen, P.usedLen));

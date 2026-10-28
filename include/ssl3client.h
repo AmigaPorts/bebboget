@@ -41,11 +41,17 @@ class Ssl3Client : public Ssl3 {
     int supportSessionTicket;   ///< whether session tickets are supported
     uint8_t css[6];             ///< selected cipher suite identifier
     int sloppy;                 ///< sloppy mode flag
+    int hrrGroup;               ///< key share group asked for by a HelloRetryRequest, 0 if none
+    int gotHrr;                 ///< last parsed ServerHello was a HelloRetryRequest
+    int ccsSeen;                ///< the server's TLS1.3 change cipher spec was already consumed
+    bytea hrrCookie;            ///< cookie from a HelloRetryRequest, echoed in the second ClientHello
+    bytea ecPriv;               ///< private key of a secp256r1/secp384r1 key share
 
 public:
     /// Construct SSL3/TLS client with given cipher suites
     Ssl3Client(const uint8_t** ciphersuites = Ssl3::CIPHERSUITES)
-        : Ssl3(ciphersuites), supportSessionTicket(false), sloppy(false) {}
+        : Ssl3(ciphersuites), supportSessionTicket(false), sloppy(false),
+          hrrGroup(0), gotHrr(false), ccsSeen(false) {}
 
     /// Destructor
     ~Ssl3Client();
@@ -79,6 +85,8 @@ private:
     int addSignatureAlgorithms(uint8_t* b, int off);
     int addSupportedVersions(uint8_t* b, int off);
     int addKeyShare(uint8_t* b, int off);
+    int addCookie(uint8_t* b, int off);
+    int retryHello(int clientHelloLen, char const* serverName);
 
     /// Parse ServerHello and perform handshake
     int parseServerHello3();

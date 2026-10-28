@@ -53,19 +53,5 @@ bytea ECMath::x448(uint8_t *clientPrivateKey, uint8_t *dhg) {
 void ECMath::x448Pub(uint8_t *pub, uint8_t *priv) {
 }
 
-bytea ECMath::genPrivateKey(int curve) {
-    bytea x;
-    return x;
-}
-
-bytea ECMath::multX(int curve, bytez &dhg, bytez &dhgy, bytez &clientPrivateKey) {
-    bytea x;
-    return x;
-}
-
-int ECMath::byteLength(int curve) {
-    return 0;
-}
-
-void ECMath::pub(bytea &pubx, bytea &puby, int curve, bytez &clientPrivateKey) {
-}
+// genPrivateKey(), multX(), byteLength() and pub() for secp256r1/secp384r1
+// live in secpXXXr1.cpp, next to the curve parameters.

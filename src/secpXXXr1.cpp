@@ -33,6 +33,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <secp256r1.h>
+#include <ecmath.h>
+#include <rand.h>
 #include <biginteger.h>
 #include <log.h>
 #include <test.h>
@@ -365,4 +367,95 @@ int SecpR1::verify(bytez const &messageHash, bytez const &r, bytez const &s, byt
 
     // Signature valid if vx == r
     return br.equals(vx);
+}
+
+// ----------------------------------------------------------------------
+// ECDH (ECDHE key exchange) on secp256r1 / secp384r1
+// ----------------------------------------------------------------------
+
+/// Curve for a TLS named group id: 0x17 = secp256r1, 0x18 = secp384r1.
+static Curve * curveFor(int curve) {
+    switch (curve) {
+    case 0x17: return &SECP256R1;
+    case 0x18: return &SECP384R1;
+    default:   return nullptr;
+    }
+}
+
+/// Big endian bytes of v, left padded with zeros to exactly len bytes.
+static bytea toFixed(BigInteger const &v, int len) {
+    bytea raw = v.toByteArray();
+    bytea r(len);
+    int n = raw.size();
+    int skip = n > len ? n - len : 0;
+    int pad = len - (n - skip);
+    for (int i = 0; i < pad; ++i)
+        r[i] = 0;
+    memcpy(r.begin() + pad, raw.begin() + skip, n - skip);
+    return r;
+}
+
+/// k * p for an affine point p, by left to right double and add.
+static JPoint multiply(Curve *c, JPoint const &p, bytez const &k) {
+    JPoint r(BigInteger::ZERO, BigInteger::ZERO, BigInteger::ONE);
+    int bits = k.size() * 8;
+    int index = 0;
+    while (index < k.size() && k[index] == 0)
+        ++index;
+    index *= 8;
+    for (; index < bits; ++index) {
+        r = c->jacobianDouble(r);
+        if (k[index >> 3] & (0x80 >> (index & 7)))
+            r = c->jacobianAdd(r, p);
+    }
+    // Already affine when k == 1; normalize() gets z = 1 wrong.
+    if (r.z.equals(BigInteger::ONE))
+        return r;
+    return r.normalize(c->P);
+}
+
+int ECMath::byteLength(int curve) {
+    switch (curve) {
+    case 0x17: return 32;
+    case 0x18: return 48;
+    default:   return 0;
+    }
+}
+
+bytea ECMath::genPrivateKey(int curve) {
+    int len = byteLength(curve);
+    bytea k(len);
+    if (len == 0)
+        return k;
+    // Clearing the top bit keeps k below N for both curves; retry on 0.
+    do {
+        randfill(k.begin(), len);
+        k[0] &= 0x7f;
+    } while (k[0] == 0 && k[1] == 0);
+    return k;
+}
+
+void ECMath::pub(bytea &pubx, bytea &puby, int curve, bytez &clientPrivateKey) {
+    Curve *c = curveFor(curve);
+    if (!c)
+        return;
+    logme(L_DEBUG, "ECDH public key START");
+    JPoint p = multiply(c, c->G, clientPrivateKey);
+    int len = byteLength(curve);
+    pubx = toFixed(p.x, len);
+    puby = toFixed(p.y, len);
+    logme(L_DEBUG, "ECDH public key STOP");
+}
+
+bytea ECMath::multX(int curve, bytez &dhg, bytez &dhgy, bytez &clientPrivateKey) {
+    Curve *c = curveFor(curve);
+    if (!c) {
+        bytea x;
+        return x;
+    }
+    logme(L_DEBUG, "ECDH shared secret START");
+    JPoint server(dhg, dhgy);
+    JPoint p = multiply(c, server, clientPrivateKey);
+    logme(L_DEBUG, "ECDH shared secret STOP");
+    return toFixed(p.x, byteLength(curve));
 }

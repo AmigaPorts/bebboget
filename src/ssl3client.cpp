@@ -125,6 +125,7 @@ int Ssl3Client::newClientHello(char const *serverName) {
 //    	addPskExchangeModes(bos);
 	if (maxVersion >= 4)
 		off = addKeyShare(b, off);				// mandatory
+	off = addCookie(b, off);
 
 	writeBuffer.setSize(off);
 
@@ -142,6 +143,35 @@ int Ssl3Client::newClientHello(char const *serverName) {
 }
 
 int Ssl3Client::addKeyShare(uint8_t * b, int off) {
+	// After a HelloRetryRequest for secp256r1/secp384r1 send that key share,
+	// as an uncompressed point, instead of the x25519 one.
+	int ylen = ECMath::byteLength(hrrGroup);
+	if (ylen) {
+		ecPriv = ECMath::genPrivateKey(hrrGroup);
+		bytea pubx, puby;
+		ECMath::pub(pubx, puby, hrrGroup, ecPriv);
+
+		int klen = 1 + 2 * ylen;
+		b[off++] = 0;
+		b[off++] = 0x33;
+		b[off++] = (uint8_t) ((klen + 6) >> 8);
+		b[off++] = (uint8_t) (klen + 6);
+		b[off++] = (uint8_t) ((klen + 4) >> 8);
+		b[off++] = (uint8_t) (klen + 4);
+		b[off++] = 0;
+		b[off++] = (uint8_t) hrrGroup;
+		b[off++] = (uint8_t) (klen >> 8);
+		b[off++] = (uint8_t) klen;
+		b[off++] = 4; // uncompressed
+		memcpy(b + off, pubx.begin(), ylen);
+		off += ylen;
+		memcpy(b + off, puby.begin(), ylen);
+		off += ylen;
+
+		hasEekPriv = true;
+		versionMinor = 1;
+		return off;
+	}
 
 	b[off++] = 0;
 	b[off++] = 0x33;
@@ -164,6 +194,21 @@ int Ssl3Client::addKeyShare(uint8_t * b, int off) {
 
 	versionMinor = 1;
 	return off;
+}
+
+int Ssl3Client::addCookie(uint8_t * b, int off) {
+	int len = hrrCookie.size();
+	if (len == 0)
+		return off;
+
+	b[off++] = 0;
+	b[off++] = 0x2c;
+	b[off++] = (uint8_t) ((len + 2) >> 8);
+	b[off++] = (uint8_t) (len + 2);
+	b[off++] = (uint8_t) (len >> 8);
+	b[off++] = (uint8_t) len;
+	memcpy(b + off, hrrCookie.begin(), len);
+	return off + len;
 }
 
 int Ssl3Client::addSupportedVersions(uint8_t * b, int off) {
@@ -319,8 +364,11 @@ int Ssl3Client::addCipherTypes(uint8_t * b, int off) {
 }
 
 int Ssl3Client::addSessionId(uint8_t * b, int off) {
-	sessionId.setSize(32);
-	randfill(sessionId.begin(), 32);
+	// the second ClientHello after a HelloRetryRequest repeats the first one's
+	if (!hrrGroup) {
+		sessionId.setSize(32);
+		randfill(sessionId.begin(), 32);
+	}
 
 	b[off++] = 32;
 	memcpy(b + off, sessionId.begin(), 32);
@@ -328,8 +376,10 @@ int Ssl3Client::addSessionId(uint8_t * b, int off) {
 }
 
 int Ssl3Client::addClientRandom(uint8_t * b, int off) {
-	clientRandom.setSize(32);
-	randfill(clientRandom.begin(), 32);
+	if (!hrrGroup) {
+		clientRandom.setSize(32);
+		randfill(clientRandom.begin(), 32);
+	}
 	memcpy(b + off, clientRandom.begin(), 32);
 	return off + 32;
 }
@@ -385,6 +435,12 @@ int Ssl3Client::parseServerHello3() {
 	}
 	masterSecret.setSize(0);
 
+	// A HelloRetryRequest is a ServerHello with this fixed random (RFC 8446 4.1.3).
+	static const uint8_t HRR_RANDOM[32] = {
+			0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+			0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c };
+	gotHrr = !memcmp(serverRandom.begin(), HRR_RANDOM, 32);
+
 	// check for extensions as in TLS1.3
 	if (off < innerReadBuffer.size()) {
 		int totalExtLen = b[off++];
@@ -400,13 +456,41 @@ int Ssl3Client::parseServerHello3() {
 				++off;
 				versionMinor = b[off++];
 				break;
+			case 0x2c: // cookie, only in a HelloRetryRequest
+			{
+				int clen = b[off] << 8 | b[off + 1];
+				hrrCookie.setSize(clen);
+				memcpy(hrrCookie.begin(), b + off + 2, clen);
+				off += extLen;
+			}
+				break;
 			case 0x33: // early shared key
 			{
 				int ciph = b[off++];
 				ciph = ciph << 8 | b[off++];
+				if (gotHrr) {
+					// just the group the server wants a key share for
+					if (hrrGroup || !ECMath::byteLength(ciph)) {
+						logme(L_ERROR, "unsupported retry key method %08x", ciph);
+						return SSL_ERR_UNSUPPORTED_EARLY_KEY;
+					}
+					hrrGroup = ciph;
+					break;
+				}
 				int clen = b[off++];
 				clen = clen << 8 | b[off++];
-				if (ciph != 0x1D || clen != 32) {
+				int ylen = ECMath::byteLength(ciph);
+				if (ciph == hrrGroup && ylen && clen == 1 + 2 * ylen && b[off] == 4) {
+					bytea x(ylen), y(ylen);
+					memcpy(x.begin(), b + off + 1, ylen);
+					memcpy(y.begin(), b + off + 1 + ylen, ylen);
+					logme(L_DEBUG, "computing early master secret START");
+					masterSecret = ECMath::multX(ciph, x, y, ecPriv);
+					logme(L_DEBUG, "computing early master secret STOP");
+					off += clen;
+					break;
+				}
+				if (ciph != 0x1D || clen != 32 || hrrGroup) {
 					logme(L_ERROR, "unsupported early key method %08x len %ld", ciph, clen);
 					return SSL_ERR_UNSUPPORTED_EARLY_KEY;
 				}
@@ -423,6 +507,14 @@ int Ssl3Client::parseServerHello3() {
 			}
 		}
 	}
+	if (gotHrr) {
+		if (!hrrGroup && !hrrCookie.size()) {
+			logme(L_ERROR, "HelloRetryRequest without a key share or cookie");
+			return SSL_ERR_UNSUPPORTED_EARLY_KEY;
+		}
+		return selected - ciphersuites;
+	}
+
 	if (masterSecret.size() == 0) {
 		hasEekPriv = false;
 		if (versionMinor >= 4)
@@ -445,6 +537,11 @@ int Ssl3Client::connect(io::InputStream *_is, io::OutputStream *_os, char const 
 
 	rhashBuffer.setSize(0);
 	rpos = readBuffer.size();
+
+	hrrGroup = 0;
+	gotHrr = false;
+	ccsSeen = false;
+	hrrCookie.setSize(0);
 
 	int len = newClientHello(to);
 	logme(L_DEBUG, "sending CLIENT_HELLO");
@@ -471,6 +568,16 @@ int Ssl3Client::connect(io::InputStream *_is, io::OutputStream *_os, char const 
 	bytea oldSessionId; // = sessionId;
 
 	cipherIndex = parseServerHello3();
+	if (cipherIndex >= 0 && gotHrr) {
+		int r = retryHello(len, to);
+		if (r < 0)
+			return r;
+		cipherIndex = parseServerHello3();
+		if (cipherIndex >= 0 && gotHrr) {
+			logme(L_ERROR, "second HelloRetryRequest");
+			return SSL_ERR_UNSUPPORTED_EARLY_KEY;
+		}
+	}
 	if (cipherIndex < 0) {
 		logme(L_ERROR, "no matching ciphersuite");
 		return SSL_ERR_NO_MATCHING_CIPHERSUITE;
@@ -495,10 +602,79 @@ int Ssl3Client::connect(io::InputStream *_is, io::OutputStream *_os, char const 
 	return r;
 }
 
+/**
+ * Answer a HelloRetryRequest: replace the first ClientHello in the transcript
+ * by its hash (RFC 8446 4.4.1), send the second ClientHello with the key share
+ * the server asked for, and read the ServerHello that follows.
+ * clientHelloLen is the length of the first ClientHello record.
+ */
+int Ssl3Client::retryHello(int clientHelloLen, char const *serverName) {
+	logme(L_DEBUG, "received HELLO_RETRY_REQUEST for group %04lx", hrrGroup);
+
+	// pendingHandshake holds ClientHello1 followed by the HelloRetryRequest
+	int chLen = clientHelloLen - 5;
+	MessageDigest *md;
+	if (ciphersuites[cipherIndex][4] == 5)
+		md = new SHA384();
+	else
+		md = new SHA256();
+	int hlen = md->len();
+	uint8_t chHash[hlen];
+	md->update(pendingHandshake.begin(), chLen);
+	md->digest(chHash);
+	delete md;
+
+	int hrrLen = pendingHandshake.size() - chLen;
+	bytea hrr(hrrLen);
+	memcpy(hrr.begin(), pendingHandshake.begin() + chLen, hrrLen);
+
+	pendingHandshake.setSize(0);
+	uint8_t messageHash[4] = { 254, 0, 0, (uint8_t) hlen };
+	updateHandshakeHashes(messageHash, 4);
+	updateHandshakeHashes(chHash, hlen);
+	updateHandshakeHashes(hrr.begin(), hrrLen);
+
+	int len = newClientHello(serverName);
+	// only the first ClientHello may use record version 3.1 (RFC 8446 5.1)
+	writeBuffer[2] = 3;
+	logme(L_DEBUG, "sending second CLIENT_HELLO");
+	if (isLogLevel(L_TRACE))
+		_dump("NEW_CLIENT_HELLO", writeBuffer.begin(), len);
+	os->write(writeBuffer.begin(), len);
+	os->flush();
+
+	// Servers in middlebox compatibility mode send their change cipher spec
+	// right after the HelloRetryRequest; skip it here, not after ServerHello.
+	if (rpos >= readBuffer.size()) {
+		if (readahead() <= 0) {
+			logme(L_ERROR, "no server hello received");
+			return SSL_ERR_NO_SERVER_HELLO;
+		}
+		if (r5[0] == 20) {
+			rpos = readBuffer.size();
+			ccsSeen = true;
+		}
+	}
+
+	if (hs_read(2) <= 0) {
+		if (r5[0] == 21 && readBuffer.size() >= 2)
+			logme(L_ERROR, "alert %ld/%ld after second client hello", readBuffer[0], readBuffer[1]);
+		logme(L_ERROR, "no server hello received");
+		return SSL_ERR_NO_SERVER_HELLO;
+	}
+	logme(L_DEBUG, "received SERVER_HELLO");
+	if (isLogLevel(L_TRACE))
+		_dump("SERVER_HELLO", innerReadBuffer.begin(), innerReadBuffer.size());
+	return 0;
+}
+
 int Ssl3Client::tls13Handshake(bytea &oldSessionId) {
 	uint8_t *b;
-	uint8_t onebyte[2];
-	rawread(onebyte, 1, 20);
+	uint8_t onebyte[2] = { 0, 0 };
+	if (ccsSeen)
+		onebyte[0] = 1;
+	else
+		rawread(onebyte, 1, 20);
 	if (onebyte[0] != 1) {
 		logme(L_ERROR, "expected 0x01 got %02lx", onebyte[0]);
 		return SSL_ERR_NO_TLS_HANDSHAKE_BYTE;
@@ -982,9 +1158,11 @@ _dump("preMasterSecret", preMasterSecret.begin(), 32);
 		ECMath::x448Pub(b + 10, clientPrivateKey.begin());
 		dlen = 57;
 	} else {
+		int ylen = ECMath::byteLength(curve);
+		if (ylen == 0)
+			return SSL_ERR_NO_SUPPORTED_ALGORITHM;
 		bytea clientPrivateKey = ECMath::genPrivateKey(curve);
 		preMasterSecret = ECMath::multX(curve, this->dhg, this->dhgy, clientPrivateKey);
-		int ylen = ECMath::byteLength(curve);
 		int osize = preMasterSecret.size();
 		if (osize < ylen) {
 			int delta = ylen - osize;
@@ -1003,6 +1181,7 @@ _dump("preMasterSecret", preMasterSecret.begin(), 32);
 
 		dlen = 2 * ylen + 2;
 		writeBuffer.setSize(dlen + 9);
+		b = writeBuffer.begin();
 
 		b[9] = (uint8_t) (1 + ylen * 2);
 		b[10] = 4; // uncompressed
@@ -1225,6 +1404,8 @@ int Ssl3Client::ssl3Handshake(bytea &oldSessionId) {
 		} else {
 			len = newClientKeyExchange3RSA(certs);
 		}
+		if (len < 0)
+			return len;
 		if (isLogLevel(L_TRACE))
 			_dump("sending client done", writeBuffer.begin(), len);
 		os->write(writeBuffer.begin(), len);
