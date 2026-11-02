@@ -54,6 +54,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define __stdargs
 
@@ -106,7 +107,12 @@ static char * loc;
 static int progress = true;
 static int clientHeaders;
 static int serverHeaders;
-static long timeout = 15;
+// -T and friends as in wget: seconds plus microseconds, 0 means no timeout
+static long readTimeout = 900;
+static long readTimeoutUs;
+static long connectTimeout;
+static long connectTimeoutUs;
+static int tries = 20; // -t as in wget, 0 means no limit
 static int overwrite;
 static const char * outDir;
 static int pmin = 3;
@@ -128,11 +134,16 @@ static void printUsage() {
     puts("    -I            install all certificates");
     puts("    -O            overwrite the file");
     puts("    -S            print the incoming headers");
-    puts("    -T <n>        set timeout in seconds, default=15");
+    puts("    -T <n>        set connect and read timeout in seconds, 0=none");
+    puts("    -t <n>        number of tries, 0 or inf=no limit, default=20");
     puts("    -o <outname>  use this as out file name");
     puts("    -p            print progress and verbosity 4 = INFO");
     puts("    -q            print errors only");
     puts("    -v <n>        set verbosity, defaults to 2 = ERROR");
+    puts("    --connect-timeout <n> connect timeout in seconds, default=none");
+    puts("    --read-timeout <n>    idle read timeout in seconds, default=900");
+    puts("    --timeout <n> same as -T");
+    puts("    --tries <n>   same as -t");
     puts("    --cipher <c>  use the given cipher, default uses all");
     puts("    --max <n>     max supported protocol version, default=4");
     puts("    --min <n>     min supported protocol version, default=3");
@@ -170,6 +181,34 @@ static int addCipher(char const * cname) {
     }
     printf("error: unknown cipher '%s'\n", cname);
     return false;
+}
+
+// The value of an option: what follows its name, after an optional '=',
+// or else the next argument. 0 if there is none.
+static char const * optionValue(char const * rest, unsigned argc, const char **argv, unsigned & i) {
+    if (*rest == '=')
+        ++rest;
+    if (*rest)
+        return rest;
+    if (i + 1 == argc)
+        return 0;
+    return argv[++i];
+}
+
+// Seconds, possibly with a fraction as in "0.5", as wget takes them.
+static void parseSeconds(char const * s, long * seconds, long * microSeconds) {
+    char * end;
+    *seconds = strtoul(s, &end, 10);
+    *microSeconds = 0;
+    if (*end == '.') {
+        long scale = 100000;
+        for (char const * d = end + 1; *d >= '0' && *d <= '9' && scale; ++d, scale /= 10)
+            *microSeconds += (*d - '0') * scale;
+    }
+}
+
+static void parseTries(char const * s) {
+    tries = strcmp(s, "inf") ? strtoul(s, 0, 10) : 0;
 }
 
 static void parseParams(unsigned argc, const char **argv) {
@@ -219,17 +258,22 @@ static void parseParams(unsigned argc, const char **argv) {
             case 'S':
                 serverHeaders = true;
                 continue;
-            case 'T':
-                if (arg[2]) {
-                    timeout = strtoul(&arg[2], 0, 10);
-                    continue;
-                }
-
-                if (i + 1 == argc)
+            case 'T': {
+                char const * v = optionValue(&arg[2], argc, argv, i);
+                if (!v)
                     goto missing;
-                timeout = strtoul(argv[++i], 0, 10);
-
+                parseSeconds(v, &readTimeout, &readTimeoutUs);
+                connectTimeout = readTimeout;
+                connectTimeoutUs = readTimeoutUs;
                 continue;
+            }
+            case 't': {
+                char const * v = optionValue(&arg[2], argc, argv, i);
+                if (!v)
+                    goto missing;
+                parseTries(v);
+                continue;
+            }
             case 'o':
                 if (arg[2]) {
                     outFile = &arg[2];
@@ -308,6 +352,36 @@ static void parseParams(unsigned argc, const char **argv) {
                     if (i + 1 == argc)
                         goto missing;
                     nredir = strtoul(argv[++i], 0, 10);
+                    continue;
+                }
+                if (0 == strncmp("tries", &arg[2], 5)) {
+                    char const * v = optionValue(&arg[7], argc, argv, i);
+                    if (!v)
+                        goto missing;
+                    parseTries(v);
+                    continue;
+                }
+                if (0 == strncmp("timeout", &arg[2], 7)) {
+                    char const * v = optionValue(&arg[9], argc, argv, i);
+                    if (!v)
+                        goto missing;
+                    parseSeconds(v, &readTimeout, &readTimeoutUs);
+                    connectTimeout = readTimeout;
+                    connectTimeoutUs = readTimeoutUs;
+                    continue;
+                }
+                if (0 == strncmp("connect-timeout", &arg[2], 15)) {
+                    char const * v = optionValue(&arg[17], argc, argv, i);
+                    if (!v)
+                        goto missing;
+                    parseSeconds(v, &connectTimeout, &connectTimeoutUs);
+                    continue;
+                }
+                if (0 == strncmp("read-timeout", &arg[2], 12)) {
+                    char const * v = optionValue(&arg[14], argc, argv, i);
+                    if (!v)
+                        goto missing;
+                    parseSeconds(v, &readTimeout, &readTimeoutUs);
                     continue;
                 }
                 if (0 == strncmp("sloppy", &arg[2], 6)) {
@@ -483,7 +557,7 @@ static void updateStats() {
         return;
 
     nowTime(&now);
-    if (pos == 0) {
+    if (pos == 0 || !firstDone) {
         if (!firstDone) {
             firstDone = true;
             startTime = now;
@@ -579,6 +653,68 @@ char const * mkFileName(char const * path) {
     return r;
 }
 
+// Exit codes, the same wget uses.
+#define EXIT_GENERIC 1
+#define EXIT_IO      3
+#define EXIT_NETWORK 4
+#define EXIT_SSL     5
+#define EXIT_SERVER  8
+
+static int exitCode;
+static int retryable;         // whether the failure of the last download() may go away on another try
+static int interrupted;       // Ctrl-C
+static unsigned long restval; // bytes of src kept from a failed try, continued with a Range request
+
+static int checkBreak() {
+#if defined(__AMIGA__)
+    if (SetSignal(0L, SIGBREAKF_CTRL_C) & SIGBREAKF_CTRL_C)
+        interrupted = true;
+#endif
+    return interrupted;
+}
+
+static char const * socketError(int e) {
+    switch (e) {
+    case net::Socket::ERR_HOST_NOT_FOUND:  return "host not found";
+    case net::Socket::ERR_REFUSED:         return "connection refused";
+    case net::Socket::ERR_CONNECT_FAILED:  return "connection failed";
+    case net::Socket::ERR_CONNECT_TIMEOUT: return "connection timed out";
+    case net::Socket::ERR_READ_TIMEOUT:    return "read timed out";
+    case net::Socket::ERR_READ_ERROR:      return "read error";
+    case net::Socket::ERR_INTERRUPTED:     return "interrupted";
+    }
+    return "connection closed";
+}
+
+// End the line the progress display is on, so that messages start on their own.
+static void endProgress() {
+    if (progress && firstDone) {
+        putchar('\n');
+        firstDone = false;
+    }
+}
+
+// As in wget, a host that does not resolve or refuses the connection is
+// not tried again, while timeouts and broken connections are.
+static char * networkFailure(int e, char const * where) {
+    endProgress();
+    printf("%s %s\n", socketError(e), where);
+    if (e == net::Socket::ERR_INTERRUPTED)
+        interrupted = true;
+    exitCode = EXIT_NETWORK;
+    retryable = e != net::Socket::ERR_HOST_NOT_FOUND && e != net::Socket::ERR_REFUSED && e != net::Socket::ERR_INTERRUPTED;
+    return 0;
+}
+
+static void sleepSeconds(int seconds) {
+#if defined(__AMIGA__)
+    for (int t = seconds * 5; t > 0 && !checkBreak(); --t)
+        Delay(10);
+#else
+    sleep(seconds);
+#endif
+}
+
 char* download() {
     int isHttp = strncmp(url, "http://", 7) == 0;
     int isHttps = strncmp(url, "https://", 8) == 0;
@@ -629,8 +765,10 @@ char* download() {
         s3.prepareEEK();
     }
 
-    net::Socket socket(host, port);
-    socket.setTimeout(timeout, 0);
+    net::Socket socket(host, port, connectTimeout, connectTimeoutUs);
+    if (socket.getError())
+        return networkFailure(socket.getError(), "connecting");
+    socket.setTimeout(readTimeout, readTimeoutUs);
 
     InputStream * is;
     OutputStream * os;
@@ -643,11 +781,15 @@ char* download() {
 
         if (r) {
             printf("error %ld\n", r);
+            if (socket.getError())
+                return networkFailure(socket.getError(), "during the TLS handshake");
+            exitCode = EXIT_NETWORK;
             return 0;
         }
 
         if (!sloppy && !checkCertificates(host, s3.getCerts(), installCertificates)) {
             printf("error: certificate not accepted\n");
+            exitCode = EXIT_SSL;
             return 0;
         }
 
@@ -657,8 +799,13 @@ char* download() {
         os = s3.getOutputStream();
     }
 
+    // continue what a previous try left, as wget does
+    char range[40] = "";
+    if (restval)
+        snprintf(range, sizeof(range), "Range: bytes=%lu-\r\n", restval);
+
     char *msg0 = concat("GET ", path, " HTTP/1.1\r\nhost: ", host, "\r\nConnection: close\r\n"
-            "User-Agent: BebboGet\r\n", 0);
+            "User-Agent: BebboGet\r\n", range, 0);
 
     for (int i = 0; i < headers.size(); ++i) {
         char const * h = headers[i];
@@ -676,23 +823,18 @@ char* download() {
     os->write(msg, strlen(msg));
 
     bytea rest;
-#if defined(__AMIGA__)
-    while ((SetSignal(0L,SIGBREAKF_CTRL_C) & SIGBREAKF_CTRL_C) == 0) {
-#else
-    while (1) {
-#endif
+    int status = 0;
+    int chunked = false;
+    size = 0;
+    while (!checkBreak()) {
         int start = rest.size();
         rest.setSize(rest.size() + 2048 + 1);
         int read = is->read(rest.begin() + start, 2048);
-        if (read <= 0) {
-            puts("unexpected connection close");
-            return 0;
-        }
+        if (read <= 0)
+            return networkFailure(socket.getError(), "reading the response headers");
 
         rest.setSize(start + read);
         rest[rest.size()] = 0;
-
-        size = 0;
 
         // read header
         for (;;) {
@@ -707,6 +849,12 @@ char* download() {
             if (serverHeaders)
                 printf("< %s\n", b);
 
+            if (!status && 0 == strncmp("HTTP/", b, 5)) {
+                char const * code = strchr(b, ' ');
+                if (code)
+                    status = atoi(code + 1);
+            }
+
             char *colon = strchr(b, ':');
             if (colon) {
                 *colon++ = 0;
@@ -715,6 +863,8 @@ char* download() {
 
                 if (0 == strcasecmp("Content-Length", b)) {
                     size = strtoul(colon, 0, 10);
+                } else if (0 == strcasecmp("Transfer-Encoding", b)) {
+                    chunked = 0 == strcasecmp("chunked", colon);
                 } else if (0 == strcasecmp("Location", b)) {
                     free(loc);
                     loc = strdup(colon);
@@ -736,16 +886,31 @@ char* download() {
         }
     }
 
+    endProgress();
+    puts("interrupted");
+    exitCode = EXIT_GENERIC;
+    return 0;
+
     Reading:
 
     fflush(stdout);
 
+    // 206 continues the file, anything else replaces it: also a 200 from
+    // a server that ignored the Range request
+    int append = status == 206 && restval;
+    if (!append)
+        restval = 0;
+    if (size)
+        size += restval;
+
     updateStats();
 
 #if defined(__AMIGA__)
-    BPTR out = Open(src, MODE_NEWFILE);
+    BPTR out = append ? Open(src, MODE_OLDFILE) : Open(src, MODE_NEWFILE);
+    if (out && append)
+        Seek(out, 0, OFFSET_END);
 #else
-    FILE * out = fopen(src, "wb+");
+    FILE * out = fopen(src, append ? "ab" : "wb+");
 #endif
     if (out) {
         if (rest.size() > 2) { // skip \r\n
@@ -756,14 +921,10 @@ char* download() {
 #endif
         }
 
-        pos = rest.size() - 2;
+        pos = restval + rest.size() - 2;
         updateStats();
 
-#if defined(__AMIGA__)
-        while ((SetSignal(0L,SIGBREAKF_CTRL_C) & SIGBREAKF_CTRL_C) == 0) {
-#else
-    	while (1) {
-#endif
+        while (!checkBreak()) {
     		if (size && size == pos)
     			break;
             static char buffer[8192];
@@ -787,11 +948,34 @@ char* download() {
 #endif
     } else {
         printf("can't open '%s' for writing\n", src);
+        exitCode = EXIT_IO;
+        return 0;
+    }
+
+    if (interrupted) {
+        endProgress();
+        puts("interrupted");
+        exitCode = EXIT_GENERIC;
+        return 0;
+    }
+
+    // Short of the announced length, or cut by a timeout or a broken
+    // connection: what arrived is kept and the next try continues it,
+    // unless it is chunked, where a Range would not line up.
+    int e = socket.getError();
+    if ((size && pos < size) || (e && e != net::Socket::ERR_CLOSED)) {
+        restval = size && !chunked ? pos : 0;
+        return networkFailure(e, "while reading the data");
     }
 
     if (size == 0) {
         size = pos;
         updateStats();
+    }
+
+    if (status >= 400) {
+        printf("ERROR %ld\n", (long) status);
+        exitCode = EXIT_SERVER;
     }
 
     return 0;
@@ -818,12 +1002,43 @@ __stdargs
 
     fflush(stdin);
 
+    // like wget, wait a second more after each failed try, up to 10
+    int attempt = 0;
     while (url && nredir > 0) {
-        url = download();
-        if (url && isLogLevel(L_WARN))
-            printf("redirecting to: %s\n", url);
-        --nredir;
+        ++attempt;
+        exitCode = 0;
+        retryable = false;
+        char const * next = download();
+        if (next) {
+            if (isLogLevel(L_WARN))
+                printf("redirecting to: %s\n", next);
+            url = next;
+            --nredir;
+            attempt = 0;
+            restval = 0;
+            continue;
+        }
+        if (!retryable || interrupted)
+            break;
+        if (tries && attempt >= tries) {
+            puts("giving up");
+            break;
+        }
+        int wait = attempt < 10 ? attempt : 10;
+        printf("retrying in %ld s, try %ld\n", (long) wait, (long) attempt + 1);
+        fflush(stdout);
+        sleepSeconds(wait);
+        if (interrupted) {
+            puts("interrupted");
+            exitCode = EXIT_GENERIC;
+            break;
+        }
     }
 
-    return 0;
+    if (url && nredir == 0) {
+        puts("too many redirects");
+        exitCode = EXIT_SERVER;
+    }
+
+    return exitCode;
 }}

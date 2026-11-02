@@ -107,14 +107,33 @@ namespace net {
 
         InputStream* is;
         OutputStream* os;
+        int error;
 
         int connect();
+        int connect(long seconds, long microSeconds);
         Socket(SOCKET socket, sockaddr_in const& addr);
 
     public:
+        /// Why the last connect, receive or send failed, see getError().
+        enum {
+            ERR_NONE = 0,
+            ERR_HOST_NOT_FOUND,   ///< the name did not resolve
+            ERR_REFUSED,          ///< nothing listens on that port
+            ERR_CONNECT_FAILED,   ///< unreachable, reset, ...
+            ERR_CONNECT_TIMEOUT,  ///< no answer within the connect timeout
+            ERR_READ_TIMEOUT,     ///< no data within the timeout set with setTimeout()
+            ERR_READ_ERROR,       ///< the connection broke
+            ERR_CLOSED,           ///< the peer closed the connection
+            ERR_INTERRUPTED       ///< a signal (Ctrl-C) broke a wait
+        };
+
         Socket(SOCKET sock);
         Socket(char const* const ipAddr, unsigned short ipPort);
+        /// Connect, waiting at most the given time; 0 waits as long as the stack does.
+        Socket(char const* const ipAddr, unsigned short ipPort, long connectSeconds, long connectMicroSeconds);
         ~Socket();
+
+        inline int getError() const { return error; }
 
         int cancelBlockingCall();
         int send(void const* const buffer, unsigned int size);

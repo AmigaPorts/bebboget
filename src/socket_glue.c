@@ -38,6 +38,7 @@
 #define __NO_NET_API
 #include <netdb.h>
 #include <amistdio.h>
+#include <sys/ioctl.h>
 
 struct Library * SocketBase;
 
@@ -128,4 +129,27 @@ int xsetsockopt(int socket, int level, int option_name, const void *option_value
 __stdargs
 int ioctlsocket(int socket, int req, unsigned long * argp) {
 	return IoctlSocket(socket, req, argp);
+}
+
+/* For socket.cpp, which cannot include proto/bsdsocket.h since its
+   SocketBase would clash with net::SocketBase. */
+__stdargs
+int bg_setnonblocking(int socket, int on) {
+	LONG v = on;
+	return IoctlSocket(socket, FIONBIO, (void *)&v);
+}
+
+__stdargs
+int bg_errno(void) {
+	return Errno();
+}
+
+/* The error a non-blocking connect ended with, 0 if it succeeded. */
+__stdargs
+int bg_sockerror(int socket) {
+	LONG e = 0;
+	socklen_t len = sizeof(e);
+	if (getsockopt(socket, SOL_SOCKET, SO_ERROR, (void *)&e, &len))
+		return Errno();
+	return e;
 }
