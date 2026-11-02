@@ -62,12 +62,32 @@ static struct _ {
 #include <unistd.h>
 #include <netinet/tcp.h>
 
+#include <sys/ioctl.h>
+
 #define INVALID_SOCKET (-1)
 #define SOCKET_ERROR (-1)
 #define GETERROR errno
 #define closesocket close
+
+static int setNonBlocking(int sd, int on) {
+	return ioctl(sd, FIONBIO, &on);
+}
+
+static int lastError() {
+	return errno;
+}
+
+// The error a non-blocking connect ended with, 0 if it succeeded.
+static int pendingError(int sd) {
+	int e = 0;
+	socklen_t len = sizeof(e);
+	if (getsockopt(sd, SOL_SOCKET, SO_ERROR, &e, &len))
+		return errno;
+	return e;
+}
 #elif  defined(__AMIGA__)
 #include <amistdio.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netdb.h>
@@ -79,6 +99,16 @@ inline int closesocket(int s) {
 	return close(s);
 }
 
+// in socket_glue.c, next to the bsdsocket.library base
+extern "C" {
+__stdargs int bg_setnonblocking(int sd, int on);
+__stdargs int bg_errno(void);
+__stdargs int bg_sockerror(int sd);
+}
+#define setNonBlocking bg_setnonblocking
+#define lastError bg_errno
+#define pendingError bg_sockerror
+
 #endif
 
 #include "io/socket.h"
@@ -88,9 +118,12 @@ inline int closesocket(int s) {
 using namespace io;
 using namespace net;
 
+// setTimeout() values at or above this mean no timeout
+#define NO_TIMEOUT 0x7ffffff
+
 SocketBase::SocketBase() :
 sd(INVALID_SOCKET), addr(), timeout() {
-	setTimeout(0x7ffffff, 0);
+	setTimeout(NO_TIMEOUT, 0);
 }
 
 SocketBase::~SocketBase() {
@@ -147,12 +180,12 @@ int SocketBase::setKeepAlive(int onOff) {
 	return ::setsockopt(sd, SOL_SOCKET, SO_KEEPALIVE, (char *) &onOff, 1);
 }
 
-Socket::Socket(SOCKET sock) : SocketBase(), is(0), os(0) {
+Socket::Socket(SOCKET sock) : SocketBase(), is(0), os(0), error(ERR_NONE) {
 	sd = sock;
 }
 
 Socket::Socket(char const * const ipAddr, unsigned short ipPort) :
-SocketBase(), is(0), os(0) {
+SocketBase(), is(0), os(0), error(ERR_NONE) {
 #ifdef __WIN32__  
 	WSADATA wsaData;
 	WSAStartup(((WORD) 3 << 8) | (WORD) 1, &wsaData);
@@ -163,8 +196,18 @@ SocketBase(), is(0), os(0) {
 	}
 }
 
+Socket::Socket(char const * const ipAddr, unsigned short ipPort, long connectSeconds, long connectMicroSeconds) :
+SocketBase(), is(0), os(0), error(ERR_NONE) {
+	if (!initSockAddr(addr, ipPort, ipAddr)) {
+		error = ERR_HOST_NOT_FOUND;
+		return;
+	}
+	if (connect(connectSeconds, connectMicroSeconds) == 0)
+		setTcpNoDelay(true);
+}
+
 Socket::Socket(SOCKET s, sockaddr_in const & addr_) :
-SocketBase(), is(0), os(0) {
+SocketBase(), is(0), os(0), error(ERR_NONE) {
 	sd = s;
 	addr = addr_;
 	setTcpNoDelay(true);
@@ -194,6 +237,67 @@ int Socket::connect() {
 	return 0;
 }
 
+#if defined(__linux__) || defined(__AMIGA__)
+// Connect without blocking and wait for the outcome with select(), which
+// gives up after the timeout, if any, and tells a refused connection
+// apart from the others.
+int Socket::connect(long seconds, long microSeconds) {
+	if ((sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET) {
+		error = ERR_CONNECT_FAILED;
+		return -1;
+	}
+
+#ifdef __AMIGA__
+	// bind to a local port before connecting
+	struct sockaddr_in sinLocal;
+	memset(&sinLocal, 0, sizeof(sinLocal));
+
+	sinLocal.sin_family = AF_INET;
+	sinLocal.sin_addr.s_addr = INADDR_ANY;
+	::bind(sd, (struct sockaddr *)&sinLocal, sizeof(sinLocal));
+#endif
+
+	int e = 0;
+	setNonBlocking(sd, 1);
+	if (::connect(sd, (struct sockaddr *) &addr, sizeof(addr)) == SOCKET_ERROR) {
+		e = lastError();
+		if (e == EINPROGRESS) {
+			fd_set writeFds;
+			FD_ZERO(&writeFds);
+			FD_SET(sd, &writeFds);
+			struct timeval tv;
+			tv.tv_sec = seconds;
+			tv.tv_usec = microSeconds;
+			int r = select(sd + 1, NULL, &writeFds, NULL, seconds || microSeconds ? &tv : NULL);
+			if (r == 0)
+				error = ERR_CONNECT_TIMEOUT;
+			else if (r < 0)
+				error = ERR_INTERRUPTED;
+			else
+				e = pendingError(sd);
+		}
+	}
+	if (error == ERR_NONE && e)
+		error = e == ECONNREFUSED ? ERR_REFUSED : ERR_CONNECT_FAILED;
+
+	if (error != ERR_NONE) {
+		closesocket(sd);
+		sd = INVALID_SOCKET;
+		return -1;
+	}
+	setNonBlocking(sd, 0);
+	return 0;
+}
+#else
+int Socket::connect(long, long) {
+	if (connect()) {
+		error = ERR_CONNECT_FAILED;
+		return -1;
+	}
+	return 0;
+}
+#endif
+
 int Socket::send(void const * const buffer, unsigned int size) {
 //	fd_set writeFds;
 //	FD_ZERO(&writeFds);
@@ -207,12 +311,25 @@ int Socket::send(void const * const buffer, unsigned int size) {
 }
 
 int Socket::receive(void *buffer, unsigned int size) {
-//	fd_set readFds;
-//	FD_ZERO(&readFds);
-//	FD_SET(sd, &readFds);
-//	if (select(sd + 1, &readFds, NULL, NULL, &timeout) <= 0)
-//		return -1;
-	unsigned int read = recv(sd, (char *) buffer, size, 0);
+	if (sd == INVALID_SOCKET)
+		return -1;
+	// wait for data at most the timeout; select() may change the timeval
+	if (timeout.tv_sec < NO_TIMEOUT && (timeout.tv_sec || timeout.tv_usec)) {
+		fd_set readFds;
+		FD_ZERO(&readFds);
+		FD_SET(sd, &readFds);
+		struct timeval tv = timeout;
+		int r = select(sd + 1, &readFds, NULL, NULL, &tv);
+		if (r <= 0) {
+			error = r ? ERR_INTERRUPTED : ERR_READ_TIMEOUT;
+			return -1;
+		}
+	}
+	int read = recv(sd, (char *) buffer, size, 0);
+	if (read == 0)
+		error = ERR_CLOSED;
+	else if (read < 0)
+		error = ERR_READ_ERROR;
 	return read;
 }
 
@@ -247,7 +364,7 @@ int SocketInputStream::read() {
 #ifdef DEBUG
 	printf("read() -> %ld\n", len);
 #endif
-	if (len)
+	if (len > 0)
 		return 0xff & b[0];
 	return -1;
 }
